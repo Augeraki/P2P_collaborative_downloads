@@ -32,7 +32,7 @@ def generate_file(file_path):
 
 # Create directories named peer1, peer2, ..., peer10
 for i in range(1, 11):
-    directory_name = f"peer{i}"
+    directory_name = f"shared_directory\\peer{i}"
     os.makedirs(directory_name, exist_ok=True)  # Create directory if it doesn't exist
 
     # Create four unique files named file1.txt, file2.txt, ..., file4.txt
