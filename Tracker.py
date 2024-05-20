@@ -3,18 +3,44 @@ import threading
 import socket 
 from Peer_info import PeerINFO
 
+def delete_records_by_id(data, id_to_remove):
+    files_to_delete = []#list of files no peer can provide a fragment of 
+
+    for file, records in list(data.items()):
+        # Check if records is a dictionary {token id : (set(), flag)}
+        if isinstance(records, dict):
+            # If the id_to_remove exists in the records, delete it
+            if id_to_remove in records:
+                del records[id_to_remove] 
+
+            # If the file's records are now empty, mark the file for deletion
+            if not records:
+                files_to_delete.append(file)
+        else:
+            print(f"Unexpected record format for {file}: {records}")
+
+    # Delete the files that are unavailable
+    for file in files_to_delete:
+        del data[file]
+
+
 class Tracker:
     def __init__(self) -> None:
         self.registered_peers= set() # a set of the peers that have registered an account with you 
         self.connected_peers = {} #key token_id , other attributes
         self.connections = []
-        self.available_files={} # filename, sset/list of token_id(s) of the peers that have that file 
+        self.available_files={} #self.available_files{ file1:{token_1 : ({set of pieces}, seederFlag), token_2 : ({set of pieces}, seederFlag)}
+        # filename, set/list of token_id(s) of the peers that are the seeders of that file         
+        #   
+        #   filen: {token_6: {3,2,4,5}, token 1:{1, 11, 1}}
+        # }
         self.HOST = "127.0.0.1"  # Standard loopback interface address (localhost)
         self.PORT = 65432
         self.shared_directory = "shared_directory"
         self.file_list = set()  
 
-        self.lock = threading.Lock()  
+        self.lock = threading.Lock() 
+        self.file_frags = {} #file : Total_num_of_frags
 
     def start(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -54,9 +80,9 @@ class Tracker:
                     # Implement logout functionality
                 elif request.startswith("INFORM"):
                     token_id = request.split()[1]
-                    files = request.split()[2:]
+                    
                     if token_id in self.connected_peers:
-                        self.inform(token_id , files)
+                        self.inform(token_id , request.split()[2:])
                         print(self.available_files)
                         client_socket.sendall("SUCCESSFUL INFORM".encode('utf-8'))
                     else:
@@ -81,7 +107,7 @@ class Tracker:
                 elif request.startswith("NOTIFY"):
                     token_id = request.split()[1]
                     notify_flag = request.split()[2]
-                    response = self.notify(token_id, notify_flag, request.split()[3], request.split()[4])
+                    response = self.notify(token_id, notify_flag, request.split()[3], request.split()[4] , request.split()[5])
                     client_socket.sendall(response.encode('utf-8'))
                     
 
@@ -89,7 +115,8 @@ class Tracker:
                 print(f"Error handling client request: {e}")
                 break
 
-    def notify(self, token_id, flag, filename, receivers_id):
+    def notify(self, token_id, flag, filename, receivers_id , fragment):
+       
         if flag=="True":
             self.lock.acquire()
             peer = self.connected_peers.get(token_id)
@@ -98,8 +125,23 @@ class Tracker:
             for p in self.registered_peers:
                 if p == peer:
                     p.count_downloads += 1
+                    #print peer here
+                    peer.count_downloads += 1
                     counter = p.count_downloads
-                    self.available_files.get(filename).add(int(receivers_id))
+                    #self.available_files.get(filename).add(int(receivers_id))
+                    #PHASE 2
+                    frags  = self.available_files[filename][receivers_id][0]
+                    flag = self.available_files[filename][receivers_id][1]
+                    if len(frags) == 0:
+                        frags = set()
+                    frags.add(fragment)
+                    if len(frags)== self.file_frags[filename]:
+                        flag=True
+                    self.available_files[filename][receivers_id] = (frags, flag)
+
+                    print(self.available_files)
+                    #PHASE 2
+                    #TODO fix this it should add to this token ids set and then check if the receiver peer can now become a new seeder for that file
             self.lock.release()
             print(f"File: {filename} Available from {self.available_files[filename]}")
             return f"FILE DOWNLOADED AND PEER DOWNLOAD COUNT UPDATED TO {str(counter)} ."
@@ -110,6 +152,7 @@ class Tracker:
             for p in self.registered_peers:
                 if p == peer:
                     p.count_failures += 1
+                    peer.count_failures += 1
                     counter = p.count_failures
             self.lock.release()
             return f"FILE DOWNLOAD FAILED AND PEER DOWNLOAD FAILURE COUNT UPDATED TO {str(counter)}"
@@ -165,15 +208,29 @@ class Tracker:
         else: 
             return "User does not exist please regitser" + " -1" 
         
-    def inform(self, token_id , files):
+    def inform(self, token_id , request):
+        files = []
+        frags = {}
+        for i, part in enumerate(request):
+            if i % 2 == 0 :
+                #make a list of the files we were informed of 
+                files.append(part)
+            else:
+                # make a dict of a files and  their fragments 
+                frags_list = part.split("-")
+                frags[files[-1]] = set(frags_list) #last file added has these frags 
+
+        
         for file in files:
             self.lock.acquire()
             # Add the token_id to the set/list of peers that have the file
             if self.available_files.get(file) is None:
-                self.available_files[file] = set()  #or list
+                self.available_files[file] = {}  # = {} //phase 2 {file :{ token_id :(set(), True)}}
 
-            self.available_files[file].add(int(token_id)) #or append
+            self.available_files[file][int(token_id)] = (frags[file] , True) #self.available_files[file][token_id][0].add(int(token_id))
             self.lock.release()
+        self.file_frags[file] = len(self.available_files[file][int(token_id)][0]) 
+        
     
     def reply_list(self, token_id):
         #list files to requesting peer
@@ -186,35 +243,32 @@ class Tracker:
         return reply_list # return the list of filenames
     
     def reply_details(self, filename):
+        frags = {}  #NEW
         # for a given file name, respond with a list of peers that can provide that file
         peers_info ="["
         if filename in self.available_files:
-            peer_ids = list(self.available_files[filename])
+            peer_ids = list(self.available_files[filename].keys()) #.keys()  #NEW
             for peer_id in peer_ids:
-                peer = self.connected_peers[str(peer_id)]
+                peer = (self.connected_peers[str(peer_id)])
+                #this is where we save the counters 
+                #saving the counters in the connected peers leads to them not persisting
+                frags[peer_id] = self.available_files[filename][peer_id]  #NEW
                 peers_info += PeerINFO.serialize(peer) + "|"
             peers_info = peers_info[:-1] # remove the last "|"
         peers_info += "]"
-        print(peers_info)
+        #peers_info += f"FRAGMENT_SEPARATOR{frags}"#NEW
+        peers_info += f"???{frags}"
         if peers_info == "[]":
             return "FILE DOES NOT EXIST"
         return peers_info
 
     def logout(self, token_id):
-        print(self.available_files) # remove
         
         if token_id in self.connected_peers.keys():
             del self.connected_peers[token_id]
-        #remove from connected peers
-        #this peer can no longer provide this files
-            for key in list(self.available_files.keys()):
-                value = self.available_files[key]
-                if int(token_id) in value:
-                    value.remove(int(token_id))
-                if len(value) == 0:  # If value list is empty after removal, remove the key
-                    del self.available_files[key]
+        
+            delete_records_by_id(self.available_files , int(token_id))
             print(self.available_files) # remove
-            
             return "SUCCESSFUL LOGOUT"
         else:
             return "USER NOT SIGNED IN ERROR"

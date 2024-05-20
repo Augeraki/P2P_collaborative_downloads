@@ -8,6 +8,7 @@ class PeerINFO:
         self.ip=""
         self.port=""
         
+        
 
     @staticmethod
     def serialize(self):
@@ -43,7 +44,7 @@ class PeerINFO:
     
     def __eq__(self , other):
         if isinstance(other,  PeerINFO):
-            return  self.username== other.username
+            return  self.username == other.username
         return False
     def __hash__(self):
         return hash(self.username)

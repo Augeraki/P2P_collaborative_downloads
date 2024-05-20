@@ -5,8 +5,40 @@ import os
 import time
 import sys
 import timeit
-from random import randint
+from random import randint, choice
 from time import sleep
+from partition import * #our modules for handling the fragmentation and re-construction of file fragments
+
+############################### MISC FUNCS##############################
+#misc functions
+def parse_fragment_dict(s):
+    s= s.strip("{")
+    s= s.strip("}")
+    #list of key value pairs as strings
+    pairs = s.split('), ')
+
+    # Initialize an empty dictionary
+    result = {}
+
+    # Iterate over key-value pairs
+    for pair in pairs:
+        token_id , value_str = pair.split(": ({")
+        # Convert key to integer
+        token_id = int(token_id.strip())
+
+        # Parse value
+       
+        value_parts = value_str.split("},")
+        frag_list = value_parts[0].split(", ")
+        frag_list = [frag.strip("'") for frag in frag_list]
+        value_bool = bool(value_parts[1].strip())
+        value_set = set(frag_list)
+        # Add key-value pair to dictionary
+        result[token_id] = (value_set, value_bool)
+    
+    return result
+
+########################################################################
 disconnect_server_flag = None
 class Peer:
     def __init__(self, i ) -> None:
@@ -20,7 +52,16 @@ class Peer:
         self.secret= randint(0, 100) #used to close server
         self.serverHOST = "127.0.0.1"  # The server's hostname or IP address
         self.serverPORT = 65432  # The port used by the server
-        self.shared_folder = "shared_directory/peer"+str(i) # the directory where the peer stores the files it is willing to share  
+        self.shared_folder = "shared_directory/peer"+str(i) # the directory where the peer stores the files it is willing to share 
+
+        self.file_seeder_frags_lookup = partition_allfiles(self.shared_folder) #has the number of fragments of each file we are the seeder of 
+        # a dictionary that contains the complete files (files which this Peer instance is the seeder of) and the value is the number of pieces/fragments
+
+        # NOTE (look at notes )make a data structure that keeps track of the fragements given by each peer for each file 
+        self.seeder_waitlist = []
+        self.fulfil_seeder_serve = False
+        self.response_seeder_serve_event = threading.Event()
+        self.Seeder_serve_lock = threading.Lock() 
     
     def register(self , username , password):
         """
@@ -80,9 +121,18 @@ class Peer:
             #Get a list of all the files in the shared directory
             files_in_shared_dir = os.listdir(os.getcwd() + "/" + self.shared_folder)
             print(files_in_shared_dir)
-
+            files_in_shared_dir = [filename for filename in files_in_shared_dir if filename.endswith(".txt")]
+            frags =""
+            print(self.file_seeder_frags_lookup)
             for file in files_in_shared_dir:
-                message += f" {file}"
+                for i in range(1, self.file_seeder_frags_lookup[file] + 1):
+                    if i == self.file_seeder_frags_lookup[file]:
+                        frags+=str(i) 
+                    else:
+                        frags+= (str(i) + "-")
+                message += f" {file} {frags}"
+                frags= ""
+            print(message)
 
             # Send the message to the tracker
             s.sendall(message.encode('utf-8'))
@@ -122,17 +172,21 @@ class Peer:
             message = f"DETAILS {self.session_id} {filename}"
             s.sendall(message.encode('utf-8'))
             response = s.recv(1024).decode('utf-8')
-
+        
+            response_fragments = {}
             if response.strip() != "FILE DOES NOT EXIST" :
-                peers_info = response[response.find("[")+1:response.find("]")].split("|")
+
+                response_fragments = parse_fragment_dict(response.split("???")[1])
+                peers_info = response[response.find("[")+1:response.find("]")].split("|")  #NEW
                 peers = []
                 for peer_info in peers_info:
                     peer = PeerINFO.deserialize(peer_info)
                     peers.append(peer)
-                return peers
+                print(response_fragments)
+                return peers , response_fragments
             else:
                 print(f"Error retrieving the details of the file: {response}")
-                return []
+                return [] , response_fragments
     def logout(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.serverHOST, self.serverPORT))
@@ -179,7 +233,7 @@ class Peer:
         return score_list
     
     def SimpleDownload(self , filename ): #NOTE implement notify 
-        peers = self.details(filename=filename)
+        peers = self.details(filename=filename) #add the dictionary
         evaluations = list()
 
         if len(peers) == 0:
@@ -240,12 +294,14 @@ class Peer:
         return f"NO PEER COULD SEND YOU {filename}"
      
 
-    def notify(self , peer_token, success_flag, filename, receivers_id):
+    def notify(self , peer_token, success_flag, filename, receivers_id, fragment=0):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.serverHOST, self.serverPORT))
-            message = f"NOTIFY {peer_token} {success_flag} {filename} {receivers_id}"
+            message = f"NOTIFY {peer_token} {success_flag} {filename} {receivers_id} {fragment}"
             s.sendall(message.encode('utf-8'))
             response = s.recv(1024).decode('utf-8')
+            #if response contains message that we have every fragment of the file(filename call assemble)
+
             return response
 
 
@@ -313,10 +369,51 @@ class Peer:
                         
                     else:
                         response = "UNAVAILABLE_FILE"
-                        client_socket.sendall(response.encode('utf-8'))                    
+                        client_socket.sendall(response.encode('utf-8')) 
+                elif request.startswith("SEEDER-SERVE"):
+                    self.Seeder_serve_lock.acquire()
+                    self.seeder_waitlist.append((client_socket, client_address))
+                    self.Seeder_serve_lock.release()
+                    #set the global timer flag 
+                    if not self.fulfil_seeder_serve:
+                        self.Seeder_serve_lock.acquire()
+                        self.fulfil_seeder_serve=True 
+                        self.Seeder_serve_lock.release()
+                        threading.Timer(0.2, self.select_clients_response).start()
+                    
+                    #wait until the event is completed
+                    self.response_seeder_serve_event.wait()
+                    #Event has been completed so respond to each Client accordingly 
+                    try:
+                        if 'selected' in client_socket.__dict__:
+                            pass #response with a random fragment
+                            #TODO implement , the response of data
+                        else:
+                            pass
+                            #TODO implement , the response of data
+                            #reject seeder serve
+
+                    finally:
+                        client_socket.close()
+                        self.Seeder_serve_lock.acquire()
+                        self.seeder_waitlist.remove((client_socket, client_address))
+                        self.Seeder_serve_lock.release()          
+
             except Exception as e:
                 print(f"Error handling client request: {e}")
                 break
+
+    def select_clients_response(self):
+        if self.seeder_waitlist:
+            selected_client = choice(self.seeder_waitlist) #choose a client from the list at random
+            selected_client[0].__dict__['selected'] = True #mark the selected socket
+            self.response_seeder_serve_event.set() #wake up the process waiting on this event
+
+        #reset global timer flag
+        self.fulfil_seeder_serve = False
+        self.fulfil_seeder_serve = False
+        #reset event flag
+
     def console_menu(self):
         while True:
             print("\nPeer Menu:")
@@ -330,12 +427,13 @@ class Peer:
 
             if choice == "1":
                 self.list()
+                
             elif choice == "2":
                 filename = input("\nEnter the filename to download: ")
                 self.SimpleDownload(filename)
             elif choice == "3":
                 filename = input("\nEnter the filename to get peers that host it: ")
-                peer_infos = self.details(filename) 
+                peer_infos = self.details(filename)[0]
                 
                 for p in peer_infos:
                     print(p)
@@ -410,3 +508,4 @@ def main():
                 return
 
 main()
+
